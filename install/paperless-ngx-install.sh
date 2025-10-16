@@ -22,10 +22,10 @@ $STD apt install -y \
   optipng \
   libpq-dev \
   libmagic-dev \
-  mime-support \
-  libzbar0 \
+  media-types \                     # replaces removed mime-support
+  libzbar0t64 | libzbar0 \          # allows both ABI names
   poppler-utils \
-  default-libmysqlclient-dev \
+  libmariadb-dev-compat \           # replaces default-libmysqlclient-dev
   automake \
   libtool \
   pkg-config \
@@ -45,19 +45,19 @@ $STD apt install -y \
   unpaper \
   icc-profiles-free \
   qpdf \
-  liblept5 \
   libxml2 \
   pngquant \
   zlib1g \
   tesseract-ocr \
   tesseract-ocr-eng
+# remove liblept5 — pulled in automatically by libleptonica-dev
 msg_ok "Installed OCR Dependencies"
 
 msg_info "Setup JBIG2"
 cd /opt/jbig2enc
 $STD bash ./autogen.sh
 $STD bash ./configure
-$STD make
+$STD make -j"$(nproc)"
 $STD make install
 cd /
 rm -rf /opt/jbig2enc
@@ -72,7 +72,7 @@ $STD sudo -u postgres psql -c "CREATE ROLE $DB_USER WITH LOGIN PASSWORD '$DB_PAS
 $STD sudo -u postgres psql -c "CREATE DATABASE $DB_NAME WITH OWNER $DB_USER ENCODING 'UTF8' TEMPLATE template0;"
 $STD sudo -u postgres psql -c "ALTER ROLE $DB_USER SET client_encoding TO 'utf8';"
 $STD sudo -u postgres psql -c "ALTER ROLE $DB_USER SET default_transaction_isolation TO 'read committed';"
-$STD sudo -u postgres psql -c "ALTER ROLE $DB_USER SET timezone TO 'UTC'"
+$STD sudo -u postgres psql -c "ALTER ROLE $DB_USER SET timezone TO 'UTC';"
 {
   echo "Paperless-ngx-Credentials"
   echo "Paperless-ngx Database Name: $DB_NAME"
@@ -87,7 +87,8 @@ msg_ok "Setup PostgreSQL database"
 msg_info "Setup Paperless-ngx"
 cd /opt/paperless
 $STD uv sync --all-extras
-curl -fsSL "https://raw.githubusercontent.com/paperless-ngx/paperless-ngx/main/paperless.conf.example" -o /opt/paperless/paperless.conf
+curl -fsSL "https://raw.githubusercontent.com/paperless-ngx/paperless-ngx/main/paperless.conf.example" \
+  -o /opt/paperless/paperless.conf
 mkdir -p {consume,data,media,static}
 sed -i \
   -e 's|#PAPERLESS_REDIS=redis://localhost:6379|PAPERLESS_REDIS=redis://localhost:6379|' \
@@ -113,10 +114,11 @@ msg_info "Setting up admin Paperless-ngx User & Password"
 cat <<EOF | uv run -- python /opt/paperless/src/manage.py shell
 from django.contrib.auth import get_user_model
 UserModel = get_user_model()
-user = UserModel.objects.create_user('admin', password='$DB_PASS')
-user.is_superuser = True
-user.is_staff = True
-user.save()
+if not UserModel.objects.filter(username='admin').exists():
+    user = UserModel.objects.create_user('admin', password='$DB_PASS')
+    user.is_superuser = True
+    user.is_staff = True
+    user.save()
 EOF
 msg_ok "Set up admin Paperless-ngx User & Password"
 
@@ -126,18 +128,23 @@ $STD uv run python -m nltk.downloader -d /usr/share/nltk_data snowball_data
 $STD uv run python -m nltk.downloader -d /usr/share/nltk_data stopwords
 $STD uv run python -m nltk.downloader -d /usr/share/nltk_data punkt_tab || \
 $STD uv run python -m nltk.downloader -d /usr/share/nltk_data punkt
-sed -i -e 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' /etc/ImageMagick-6/policy.xml
+# Handle both ImageMagick 6 and 7
+for f in /etc/ImageMagick-6/policy.xml /etc/ImageMagick-7/policy.xml; do
+  [ -f "$f" ] && sed -i -e 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' "$f" || true
+done
 msg_ok "Installed Natural Language Toolkit"
 
 msg_info "Creating Services"
 cat <<EOF >/etc/systemd/system/paperless-scheduler.service
 [Unit]
 Description=Paperless Celery beat
+After=redis.service
 Requires=redis.service
 
 [Service]
 WorkingDirectory=/opt/paperless/src
 ExecStart=uv run -- celery --app paperless beat --loglevel INFO
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
@@ -146,12 +153,13 @@ EOF
 cat <<EOF >/etc/systemd/system/paperless-task-queue.service
 [Unit]
 Description=Paperless Celery Workers
+After=postgresql.service redis.service
 Requires=redis.service
-After=postgresql.service
 
 [Service]
 WorkingDirectory=/opt/paperless/src
 ExecStart=uv run -- celery --app paperless worker --loglevel INFO
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
@@ -160,12 +168,14 @@ EOF
 cat <<EOF >/etc/systemd/system/paperless-consumer.service
 [Unit]
 Description=Paperless consumer
+After=redis.service
 Requires=redis.service
 
 [Service]
 WorkingDirectory=/opt/paperless/src
 ExecStartPre=/bin/sleep 2
 ExecStart=uv run -- python manage.py document_consumer
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
@@ -174,21 +184,28 @@ EOF
 cat <<EOF >/etc/systemd/system/paperless-webserver.service
 [Unit]
 Description=Paperless webserver
-After=network.target
+After=network.target redis.service
 Wants=network.target
 Requires=redis.service
 
 [Service]
 WorkingDirectory=/opt/paperless/src
-ExecStart=uv run -- granian --interface asginl --ws "paperless.asgi:application"
+ExecStart=uv run -- granian --interface asgi --ws "paperless.asgi:application"
 Environment=GRANIAN_HOST=::
 Environment=GRANIAN_PORT=8000
 Environment=GRANIAN_WORKERS=1
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl enable -q --now paperless-webserver paperless-scheduler paperless-task-queue paperless-consumer
+
+systemctl daemon-reload
+systemctl enable -q --now \
+  paperless-webserver \
+  paperless-scheduler \
+  paperless-task-queue \
+  paperless-consumer
 msg_ok "Created Services"
 
 read -r -p "${TAB3}Would you like to add Adminer? <y/N> " prompt
@@ -200,8 +217,7 @@ motd_ssh
 customize
 
 msg_info "Cleaning up"
-rm -rf /opt/paperless/docker
-rm -rf /tmp/ghostscript*
+rm -rf /opt/paperless/docker /tmp/ghostscript*
 $STD apt -y autoremove
 $STD apt -y autoclean
 $STD apt -y clean
